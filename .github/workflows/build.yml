@@ -87,8 +87,8 @@ jobs:
           # Assert the skeleton has real content (a bpftool failure truncates it to 0 bytes).
           grep -q 'ebpf_jagent_bpf__open' ebpf_jagent.skel.h
           # Assert every BPF program in the source made it into the object.
-          for prog in method_entry method_return kprobe_sock_sendmsg \
-                      kretprobe_sock_recvmsg trace_sys_enter_write object_alloc; do
+          for prog in method_entry method_return kretprobe_sock_sendmsg \
+                      kretprobe_sock_recvmsg trace_sys_exit_write object_alloc; do
             grep -qF "&obj->progs.$prog;" ebpf_jagent.skel.h
           done
 

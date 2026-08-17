@@ -20,10 +20,14 @@ typedef struct {
     size_t capacity;
 } json_builder_t;
 
-// metric entry linked list
+// metric entry, chained inside a hash bucket
 typedef struct metric_entry {
     char *class_name;
     char *method_name;
+    // Attribute JSON for this class+method, built once when the entry is
+    // created. It used to be rebuilt for every datapoint of every one of the
+    // four metrics, i.e. four times per event, escaping character by character.
+    char *attributes_json;
     uint64_t cpu_ns;
     uint64_t io_bytes;
     uint64_t memory_bytes;
@@ -32,11 +36,17 @@ typedef struct metric_entry {
     struct metric_entry *next;
 } metric_entry_t;
 
+// Distinct class+method pairs are looked up once per event. A linear walk of a
+// linked list made that O(methods) per event, so a busy service paid quadratic
+// cost overall.
+#define METRIC_BUCKETS 1024u
+
 // forward declarations
 static bool json_builder_init(json_builder_t *jb, size_t initial_capacity);
 static void json_builder_free(json_builder_t *jb);
 static bool json_builder_reserve(json_builder_t *jb, size_t additional_needed);
 static bool json_builder_appendf(json_builder_t *jb, const char *fmt, ...);
+static bool json_builder_append(json_builder_t *jb, const char *s, size_t n);
 static bool json_builder_escape_and_append(json_builder_t *jb, const char *s);
 static bool build_attributes_json(json_builder_t *jb, const char *class_name, const char *method_name);
 static bool append_otlp_sum_metric(json_builder_t *jb, const char *name, const char *value_str,
@@ -45,8 +55,12 @@ static void send_otlp_payload(const struct otlp_config *cfg, const char *json_pa
 static size_t _curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata);
 static void free_pending_points(void);
 
-// global head of metrics list
-static metric_entry_t *g_metrics_head = NULL;
+// metric entries, chained by class+method hash
+static metric_entry_t *g_metric_buckets[METRIC_BUCKETS];
+
+// Reused across requests so curl keeps the connection alive. A fresh handle per
+// request meant a new TCP connection, and a new TLS handshake, for every send.
+static CURL *g_curl = NULL;
 
 // safe strdup equivalent
 static char *safe_strdup(const char *src)
@@ -69,10 +83,30 @@ static uint64_t get_current_time_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+// FNV-1a over class+method, for bucket selection
+static uint32_t metric_hash(const char *class_name, const char *method_name)
+{
+    uint32_t h = 2166136261u;
+
+    for (const unsigned char *p = (const unsigned char *)class_name; *p; ++p)
+    {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    for (const unsigned char *p = (const unsigned char *)method_name; *p; ++p)
+    {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
 // find or create metric entry
 static metric_entry_t *find_or_create_metric(const char *class_name, const char *method_name)
 {
-    for (metric_entry_t *entry = g_metrics_head; entry; entry = entry->next)
+    metric_entry_t **bucket = &g_metric_buckets[metric_hash(class_name, method_name) % METRIC_BUCKETS];
+
+    for (metric_entry_t *entry = *bucket; entry; entry = entry->next)
     {
         if (strcmp(entry->class_name, class_name) == 0 &&
             strcmp(entry->method_name, method_name) == 0)
@@ -97,8 +131,21 @@ static metric_entry_t *find_or_create_metric(const char *class_name, const char 
         return NULL;
     }
 
-    new_entry->next = g_metrics_head;
-    g_metrics_head = new_entry;
+    // Build the attribute JSON once; every datapoint for this method reuses it.
+    json_builder_t jb;
+    if (!json_builder_init(&jb, 192) ||
+        !build_attributes_json(&jb, class_name, method_name))
+    {
+        json_builder_free(&jb);
+        free(new_entry->class_name);
+        free(new_entry->method_name);
+        free(new_entry);
+        return NULL;
+    }
+    new_entry->attributes_json = jb.buffer; // ownership moves to the entry
+
+    new_entry->next = *bucket;
+    *bucket = new_entry;
     return new_entry;
 }
 
@@ -107,16 +154,26 @@ void free_all_metric_entries(void)
 {
     free_pending_points();
 
-    metric_entry_t *current = g_metrics_head;
-    while (current)
+    for (size_t i = 0; i < METRIC_BUCKETS; ++i)
     {
-        metric_entry_t *next = current->next;
-        free(current->class_name);
-        free(current->method_name);
-        free(current);
-        current = next;
+        metric_entry_t *current = g_metric_buckets[i];
+        while (current)
+        {
+            metric_entry_t *next = current->next;
+            free(current->class_name);
+            free(current->method_name);
+            free(current->attributes_json);
+            free(current);
+            current = next;
+        }
+        g_metric_buckets[i] = NULL;
     }
-    g_metrics_head = NULL;
+
+    if (g_curl)
+    {
+        curl_easy_cleanup(g_curl);
+        g_curl = NULL;
+    }
 }
 
 // JSON builder initialization
@@ -179,49 +236,66 @@ static bool json_builder_appendf(json_builder_t *jb, const char *fmt, ...)
     return true;
 }
 
-// escape string for JSON
+// append raw bytes
+static bool json_builder_append(json_builder_t *jb, const char *s, size_t n)
+{
+    if (n == 0)
+        return true;
+    if (!json_builder_reserve(jb, n))
+        return false;
+    memcpy(jb->buffer + jb->length, s, n);
+    jb->length += n;
+    jb->buffer[jb->length] = '\0';
+    return true;
+}
+
+// Escape string for JSON, copying runs of safe characters in one go.
+//
+// Appending a character at a time cost two vsnprintf calls per character, one
+// to measure and one to write. Java identifiers need no escaping at all, so the
+// common path is now a single memcpy of the whole name.
 static bool json_builder_escape_and_append(json_builder_t *jb, const char *s)
 {
     if (!s)
-        return json_builder_appendf(jb, "");
+        return true;
 
-    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *run = p; // start of the current unescaped run
+
+    for (; *p; ++p)
     {
+        char ubuf[8];
+        const char *esc = NULL;
+
         switch (*p)
         {
-        case '\"':
-            if (!json_builder_appendf(jb, "\\\"")) return false;
-            break;
-        case '\\':
-            if (!json_builder_appendf(jb, "\\\\")) return false;
-            break;
-        case '\b':
-            if (!json_builder_appendf(jb, "\\b")) return false;
-            break;
-        case '\f':
-            if (!json_builder_appendf(jb, "\\f")) return false;
-            break;
-        case '\n':
-            if (!json_builder_appendf(jb, "\\n")) return false;
-            break;
-        case '\r':
-            if (!json_builder_appendf(jb, "\\r")) return false;
-            break;
-        case '\t':
-            if (!json_builder_appendf(jb, "\\t")) return false;
-            break;
+        case '\"': esc = "\\\""; break;
+        case '\\': esc = "\\\\"; break;
+        case '\b': esc = "\\b"; break;
+        case '\f': esc = "\\f"; break;
+        case '\n': esc = "\\n"; break;
+        case '\r': esc = "\\r"; break;
+        case '\t': esc = "\\t"; break;
         default:
             if (*p < 0x20)
             {
-                if (!json_builder_appendf(jb, "\\u%04x", *p)) return false;
+                snprintf(ubuf, sizeof(ubuf), "\\u%04x", *p);
+                esc = ubuf;
             }
-            else
-            {
-                if (!json_builder_appendf(jb, "%c", *p)) return false;
-            }
+            break;
         }
+
+        if (!esc)
+            continue; // safe character: extend the run
+
+        if (!json_builder_append(jb, (const char *)run, (size_t)(p - run)))
+            return false;
+        if (!json_builder_append(jb, esc, strlen(esc)))
+            return false;
+        run = p + 1;
     }
-    return true;
+
+    return json_builder_append(jb, (const char *)run, (size_t)(p - run));
 }
 
 // build attributes array including job and optional class/method
@@ -306,10 +380,16 @@ static void send_otlp_payload(const struct otlp_config *cfg, const char *json_pa
     if (!cfg || !cfg->endpoint || !json_payload)
         return;
 
-    CURL *curl = curl_easy_init();
-    if (!curl)
+    // Reuse the handle so curl's connection cache can keep the socket open;
+    // reset clears the previous request's options but not that cache.
+    if (!g_curl)
+        g_curl = curl_easy_init();
+    else
+        curl_easy_reset(g_curl);
+    if (!g_curl)
         return;
 
+    CURL *curl = g_curl;
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
 
@@ -351,7 +431,6 @@ static void send_otlp_payload(const struct otlp_config *cfg, const char *json_pa
     if (!resp.buf)
     {
         curl_slist_free_all(headers);
-        curl_easy_cleanup(curl);
         return;
     }
     resp.buf[0] = '\0';
@@ -374,7 +453,7 @@ static void send_otlp_payload(const struct otlp_config *cfg, const char *json_pa
 
     free(resp.buf);
     curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+    // g_curl is deliberately kept open; free_all_metric_entries() cleans it up.
 }
 
 // publish resource demand metrics for an event
@@ -392,8 +471,8 @@ static const char *DEMAND_METRIC_FORMATS[4] = {"%.0f", "%.0f", "%.0f", "%.3f"};
 // exists to provide.
 typedef struct pending_point
 {
-    char *class_name;
-    char *method_name;
+    // Borrowed from the owning metric_entry, which outlives every flush.
+    const char *attributes_json;
     uint64_t start_time_ns;
     uint64_t time_ns;
     double values[4]; // storage, memory, network, cpu -- same order as the names
@@ -422,8 +501,6 @@ static void free_pending_points(void)
     while (current)
     {
         pending_point_t *next = current->next;
-        free(current->class_name);
-        free(current->method_name);
         free(current);
         current = next;
     }
@@ -450,8 +527,7 @@ void record_resource_demand(const struct event *event)
         return;
     }
 
-    point->class_name = safe_strdup(event->class_name);
-    point->method_name = safe_strdup(event->method_name);
+    point->attributes_json = metric->attributes_json;
     point->start_time_ns = metric->start_time_ns;
     point->time_ns = get_current_time_ns();
     point->values[0] = (double)metric->io_bytes;
@@ -472,9 +548,8 @@ void flush_resource_demands(const struct otlp_config *cfg)
     if (!g_pending_head)
         return;
 
-    json_builder_t jb, jb_res, jb_attr;
-    if (!json_builder_init(&jb, 65536) || !json_builder_init(&jb_res, 256) ||
-        !json_builder_init(&jb_attr, 256))
+    json_builder_t jb, jb_res;
+    if (!json_builder_init(&jb, 65536) || !json_builder_init(&jb_res, 256))
     {
         ERROR("Failed to initialize JSON builder.");
         free_pending_points();
@@ -508,14 +583,9 @@ void flush_resource_demands(const struct otlp_config *cfg)
             char value_buf[64];
             snprintf(value_buf, sizeof(value_buf), DEMAND_METRIC_FORMATS[i], p->values[i]);
 
-            jb_attr.length = 0;
-            jb_attr.buffer[0] = '\0';
-            if (!build_attributes_json(&jb_attr, p->class_name, p->method_name))
-                continue;
-
             if (!first)
                 json_builder_appendf(&jb, ",");
-            append_datapoint(&jb, jb_attr.buffer, value_buf, p->start_time_ns, p->time_ns);
+            append_datapoint(&jb, p->attributes_json, value_buf, p->start_time_ns, p->time_ns);
             first = false;
         }
 
@@ -530,8 +600,12 @@ void flush_resource_demands(const struct otlp_config *cfg)
 cleanup:
     json_builder_free(&jb);
     json_builder_free(&jb_res);
-    json_builder_free(&jb_attr);
     free_pending_points();
+}
+
+size_t pending_resource_demand_count(void)
+{
+    return g_pending_count;
 }
 
 void publish_resource_demand_vector(const struct event *event, const struct otlp_config *cfg)

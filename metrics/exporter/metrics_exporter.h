@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "model/event.h"
 #include "environment/env_loader.h"
 
@@ -41,6 +42,14 @@ void record_resource_demand(const struct event *event);
  * @param cfg Pointer to a populated OTLP configuration. Must not be NULL.
  */
 void flush_resource_demands(const struct otlp_config *cfg);
+
+/**
+ * Number of datapoints queued by record_resource_demand() since the last flush.
+ *
+ * Lets the caller bound the size of a single OTLP request by flushing early
+ * when a burst of events queues up between scheduled flushes.
+ */
+size_t pending_resource_demand_count(void);
 
 /**
  * Sends a JSON payload containing the aggregate process CPU time (job-scoped) without

@@ -69,8 +69,11 @@ jobs:
 
           Before running, copy env.example to .env in the working directory and
           set JVM_LIB_PATH to your JVM's libjvm.so. Requires root (or CAP_BPF +
-          CAP_PERFMON), a kernel with BTF, and a JVM started with
-          -XX:+DTraceAllocProbes -XX:+DTraceMethodProbes.
+          CAP_PERFMON), and a JVM started with -XX:+DTraceAllocProbes
+          -XX:+DTraceMethodProbes.
+
+          Kernel: 5.11 or newer, built with BTF (CONFIG_DEBUG_INFO_BTF).
+          5.8 is required for the ring buffer and 5.11 for task-local storage.
 
             sudo ./ebpf-jagent -p <java-pid> -f <filter>
 
