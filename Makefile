@@ -33,11 +33,18 @@ KERNEL_SRC ?= /usr/src/linux-headers-$(shell uname -r)
 # flags
 CFLAGS     := -O2 -g -Wall -MMD -MP \
               -I$(EXPORTER_DIR) -I$(MODEL_DIR) -I$(ENV_DIR) -I$(IMPORTER_DIR) -I$(PROJECT_ROOT)
+# Compiling with `-target bpf` drops the host include paths, so the <asm/*.h>
+# headers that bpf/usdt.bpf.h reaches via <linux/errno.h> are not found. On
+# Debian/Ubuntu they live in the multiarch directory; adding it here avoids
+# having to symlink asm-generic into /usr/include, as the Dockerfile does.
+ARCH_TRIPLET := $(shell dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo $(shell uname -m)-linux-gnu)
+
 BPF_CFLAGS := -target bpf -D__TARGET_ARCH_x86 \
               -I$(KERNEL_SRC)/include/uapi \
               -I$(KERNEL_SRC)/include \
               -I$(KERNEL_SRC)/arch/x86/include/uapi \
               -I$(KERNEL_SRC)/arch/x86/include \
+              -I/usr/include/$(ARCH_TRIPLET) \
               -I.
 
 LDFLAGS := -lbpf -lelf -lz -lcurl

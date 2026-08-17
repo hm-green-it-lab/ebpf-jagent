@@ -22,6 +22,58 @@
 #define MAX_FILTER_LEN 64
 #define DEFAULT_OUTPUT_FILE "method_trace.txt"
 
+// Selectable resource dimensions.
+//
+// CPU and the transaction boundary both come from the method__entry/
+// method__return USDT probes, so those are always attached; without them there
+// is nothing to attribute anything to. Memory, network and storage each have
+// their own probe and can be switched off, which matters when comparing
+// against an agent that only collects a subset: probes that are attached cost
+// their firing overhead whether or not the resulting values are used.
+struct probe_selection
+{
+    bool memory;  // usdt object__alloc
+    bool network; // kprobe sock_sendmsg + kretprobe sock_recvmsg
+    bool storage; // tracepoint sys_enter_write
+};
+
+// Parse a comma-separated dimension list such as "cpu,memory".
+// Returns false on an unknown name.
+static bool parse_probes(const char *spec, struct probe_selection *sel)
+{
+    if (strcmp(spec, "all") == 0)
+    {
+        sel->memory = sel->network = sel->storage = true;
+        return true;
+    }
+
+    sel->memory = sel->network = sel->storage = false;
+
+    char buffer[128];
+    snprintf(buffer, sizeof(buffer), "%s", spec);
+
+    for (char *token = strtok(buffer, ","); token; token = strtok(NULL, ","))
+    {
+        while (*token == ' ')
+            token++;
+
+        if (strcmp(token, "cpu") == 0)
+            continue; // always on: it is the method probe itself
+        else if (strcmp(token, "memory") == 0)
+            sel->memory = true;
+        else if (strcmp(token, "network") == 0)
+            sel->network = true;
+        else if (strcmp(token, "storage") == 0)
+            sel->storage = true;
+        else
+        {
+            fprintf(stderr, "unknown probe dimension: %s\n", token);
+            return false;
+        }
+    }
+    return true;
+}
+
 // simple logging helpers
 #define LOG_INFO(fmt, ...)                                  \
     do                                                      \
@@ -61,10 +113,18 @@ static void init_otlp_http()
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s -p <java-pid> [-f <filter_substring>] [output_file] [--no-print]\n"
+            "Usage: %s -p <java-pid> [-f <filter_substring>] [--probes <list>] [output_file] [--no-print]\n"
             "  -p, --pid <java-pid>        PID of Java process to trace (required)\n"
             "  -f, --filter <substring>    Optional substring to filter class/method names\n"
-            "  output_file                Optional output file (default: %s)\n"
+            "  --probes <list>            Resource dimensions to collect, comma separated:\n"
+            "                              cpu,memory,network,storage or all (default: all).\n"
+            "                              cpu is always collected: it comes from the same\n"
+            "                              method probes that delimit a transaction.\n"
+            "                              Unselected dimensions are never attached, so their\n"
+            "                              probes cost nothing.\n"
+            "  output_file                Optional output file (default: %s).\n"
+            "                              Use /dev/null to skip the per-transaction trace;\n"
+            "                              the OTLP metrics carry the same values.\n"
             "  --no-print                 Suppress startup banner/info prints\n"
             "  -h                         Show this help message and exit\n"
             "\n"
@@ -159,12 +219,15 @@ int main(int argc, char **argv)
     const char *output_path = DEFAULT_OUTPUT_FILE;
     bool no_print = false;
     pid_t target_pid = 0;
+    // Default matches the historical behaviour: collect everything.
+    struct probe_selection probes = {.memory = true, .network = true, .storage = true};
 
     // getopt_long setup: -p/--pid, -f/--filter, -h, --no-print
     static struct option long_opts[] = {
         {"pid", required_argument, NULL, 'p'},
         {"filter", required_argument, NULL, 'f'},
         {"no-print", no_argument, NULL, 0}, // handled via flag key 0
+        {"probes", required_argument, NULL, 0},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -180,6 +243,14 @@ int main(int argc, char **argv)
             if (strcmp(long_opts[long_index].name, "no-print") == 0)
             {
                 no_print = true;
+            }
+            else if (strcmp(long_opts[long_index].name, "probes") == 0)
+            {
+                if (!parse_probes(optarg, &probes))
+                {
+                    fprintf(stderr, "use -h for options.\n");
+                    return 1;
+                }
             }
             break;
         case 'p':
@@ -305,42 +376,63 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    skel->links.kprobe_sock_sendmsg =
-    bpf_program__attach_kprobe(skel->progs.kprobe_sock_sendmsg, false, "sock_sendmsg");
-    if (!skel->links.kprobe_sock_sendmsg)
+    // The network and storage probes hook kernel-wide functions, so unlike the
+    // USDT probes they cannot be scoped to the target process. Leaving them
+    // attached when their dimension is not collected would make every socket
+    // operation and every write() on the machine trap for nothing.
+    if (probes.network)
     {
-        LOG_ERROR("failed to attach tracepoint sock_sendmsg");
-        ret = 1;
-        goto cleanup;
+        skel->links.kprobe_sock_sendmsg =
+            bpf_program__attach_kprobe(skel->progs.kprobe_sock_sendmsg, false, "sock_sendmsg");
+        if (!skel->links.kprobe_sock_sendmsg)
+        {
+            LOG_ERROR("failed to attach kprobe sock_sendmsg");
+            ret = 1;
+            goto cleanup;
+        }
+
+        skel->links.kretprobe_sock_recvmsg =
+            bpf_program__attach_kprobe(skel->progs.kretprobe_sock_recvmsg, true, "sock_recvmsg");
+        if (!skel->links.kretprobe_sock_recvmsg)
+        {
+            LOG_ERROR("failed to attach kretprobe sock_recvmsg");
+            ret = 1;
+            goto cleanup;
+        }
     }
 
-  skel->links.kretprobe_sock_recvmsg =
-    bpf_program__attach_kprobe(skel->progs.kretprobe_sock_recvmsg, true, "sock_recvmsg");
- if (!skel->links.kretprobe_sock_recvmsg)
+    if (probes.storage)
     {
-        LOG_ERROR("failed to attach tracepoint sock_recvmsg");
-        ret = 1;
-        goto cleanup;
+        skel->links.trace_sys_enter_write =
+            bpf_program__attach_tracepoint(skel->progs.trace_sys_enter_write, "syscalls", "sys_enter_write");
+        if (!skel->links.trace_sys_enter_write)
+        {
+            LOG_ERROR("failed to attach tracepoint sys_enter_write");
+            ret = 1;
+            goto cleanup;
+        }
     }
 
-    skel->links.trace_sys_enter_write =
-        bpf_program__attach_tracepoint(skel->progs.trace_sys_enter_write, "syscalls", "sys_enter_write");
-    if (!skel->links.trace_sys_enter_write)
+    if (probes.memory)
     {
-        LOG_ERROR("failed to attach tracepoint sys_enter_write");
-        ret = 1;
-        goto cleanup;
+        skel->links.object_alloc =
+            bpf_program__attach_usdt(skel->progs.object_alloc, target_pid,
+                                     jvm_lib_path,
+                                     "hotspot", "object__alloc", NULL);
+        if (!skel->links.object_alloc)
+        {
+            LOG_ERROR("failed to attach USDT object_alloc");
+            ret = 1;
+            goto cleanup;
+        }
     }
 
-    skel->links.object_alloc =
-        bpf_program__attach_usdt(skel->progs.object_alloc, target_pid,
-                                 jvm_lib_path,
-                                 "hotspot", "object__alloc", NULL);
-    if (!skel->links.object_alloc)
+    if (!no_print)
     {
-        LOG_ERROR("failed to attach USDT object_alloc");
-        ret = 1;
-        goto cleanup;
+        LOG_INFO("collecting: cpu%s%s%s",
+                 probes.memory ? ", memory" : "",
+                 probes.network ? ", network" : "",
+                 probes.storage ? ", storage" : "");
     }
 
     outf = fopen(output_path, "w");
