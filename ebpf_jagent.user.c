@@ -27,6 +27,10 @@
 // event cannot stall the drain indefinitely.
 #define MAX_STALL_CYCLES 3
 
+// Grace period before the final drain, so events whose slot was reserved just
+// as the interrupt arrived are written before the last read.
+#define FINAL_DRAIN_SETTLE_MS 300
+
 // Selectable resource dimensions.
 //
 // CPU and the transaction boundary both come from the method__entry/
@@ -139,6 +143,92 @@ static void print_usage(const char *prog)
             prog, DEFAULT_OUTPUT_FILE);
 }
 
+// State carried between drain cycles.
+struct drain_state
+{
+    struct bpf_map *map_cnt;
+    struct bpf_map *map_ev;
+    uint32_t cnt_key;
+    uint64_t last_id;
+    // An id whose slot is reserved but not yet readable, so the drain can wait
+    // for it without blocking forever if it never appears.
+    uint64_t stalled_id;
+    unsigned stall_cycles;
+    FILE *outf;
+    struct otlp_config *cfg;
+};
+
+// Consume every event the kernel has published since the last call.
+//
+// Ids are reserved in order but written marginally later, so a gap means "not
+// written yet", not "lost": the drain stops there and resumes on the next
+// cycle. On the final pass no further writes are coming, so gaps are skipped
+// rather than waited for.
+//
+// Returns the number of events consumed.
+static uint64_t drain_events(struct drain_state *st, bool final_pass)
+{
+    uint64_t count = 0;
+    uint64_t consumed = 0;
+
+    if (bpf_map__lookup_elem(st->map_cnt, &st->cnt_key, sizeof(st->cnt_key),
+                             &count, sizeof(count), 0) != 0)
+        return 0;
+
+    uint64_t id = st->last_id;
+    while (id < count)
+    {
+        struct event ev;
+        if (bpf_map__lookup_elem(st->map_ev, &id, sizeof(id), &ev, sizeof(ev), 0) != 0)
+        {
+            if (final_pass)
+            {
+                id++; // nothing more is coming; do not wait for it
+                continue;
+            }
+            if (id == st->stalled_id && ++st->stall_cycles >= MAX_STALL_CYCLES)
+            {
+                LOG_ERROR("event %" PRIu64 " never materialised; skipping", id);
+                st->stalled_id = UINT64_MAX;
+                st->stall_cycles = 0;
+                id++;
+                continue;
+            }
+            if (id != st->stalled_id)
+            {
+                st->stalled_id = id;
+                st->stall_cycles = 1;
+            }
+            break;
+        }
+
+        st->stalled_id = UINT64_MAX;
+        st->stall_cycles = 0;
+
+        fprintf(st->outf,
+                "%s.%s — wall:%" PRIu64 " ns  cpu:%" PRIu64 " ns "
+                "tx:%" PRIu64 "  rx:%" PRIu64 "  io:%" PRIu64 "  alloc:%" PRIu64 "\n",
+                ev.class_name, ev.method_name,
+                ev.wdelta, ev.cdelta, ev.net_tx, ev.net_rx, ev.io, ev.alloc);
+
+        record_resource_demand(&ev);
+
+        // remove processed event so map window can advance
+        bpf_map__delete_elem(st->map_ev, &id, sizeof(id), 0);
+        consumed++;
+        id++;
+    }
+
+    // One request for the whole batch rather than one per transaction: the
+    // per-event round trip could not keep up with the service, so events piled
+    // up in the map and were discarded on shutdown.
+    flush_resource_demands(st->cfg);
+
+    // Resume from the first id not yet consumed, not from `count`.
+    st->last_id = id;
+    return consumed;
+}
+
 // core polling & processing loop: reads BPF maps, publishes metrics, writes events
 static int run_tracing_loop(pid_t target_pid,
                             const char *filter,
@@ -148,15 +238,16 @@ static int run_tracing_loop(pid_t target_pid,
                             const char *output_path,
                             bool no_print)
 {
-    struct bpf_map *map_cnt = skel->maps.event_cnt;
-    struct bpf_map *map_ev = skel->maps.events_map;
-    uint32_t event_cnt_key = 0;
-    uint64_t last_id = 0;
-
-    // Tracks an id whose slot is reserved but not yet readable, so the drain
-    // can wait for it without blocking forever if it never appears.
-    uint64_t stalled_id = UINT64_MAX;
-    unsigned stall_cycles = 0;
+    struct drain_state st = {
+        .map_cnt = skel->maps.event_cnt,
+        .map_ev = skel->maps.events_map,
+        .cnt_key = 0,
+        .last_id = 0,
+        .stalled_id = UINT64_MAX,
+        .stall_cycles = 0,
+        .outf = outf,
+        .cfg = cfg,
+    };
 
     if (!no_print)
     {
@@ -168,73 +259,13 @@ static int run_tracing_loop(pid_t target_pid,
 
     while (!exiting)
     {
-        uint64_t count = 0;
-
         uint64_t total_cpu_ns = 0;
         if (get_process_cpu_time_ns(target_pid, &total_cpu_ns) == 0)
         {
             publish_process_cpu(total_cpu_ns, cfg);
         }
 
-        // lookup current event count; if successful, iterate new events
-        if (bpf_map__lookup_elem(map_cnt, &event_cnt_key, sizeof(event_cnt_key),
-                                 &count, sizeof(count), 0) == 0)
-        {
-            // A slot is reserved (counter incremented) marginally before the
-            // event is written, so the newest id may not be readable yet.
-            // Stop at the first gap and retry on the next cycle instead of
-            // advancing past it: the previous code set last_id = count
-            // unconditionally, which discarded any not-yet-written event
-            // permanently. A gap that never fills is skipped after
-            // MAX_STALL_CYCLES so one lost event cannot stall the drain.
-            uint64_t id = last_id;
-            while (id < count)
-            {
-                struct event ev;
-                if (bpf_map__lookup_elem(map_ev, &id, sizeof(id),
-                                         &ev, sizeof(ev), 0) != 0)
-                {
-                    if (id == stalled_id && ++stall_cycles >= MAX_STALL_CYCLES)
-                    {
-                        LOG_ERROR("event %" PRIu64 " never materialised; skipping", id);
-                        stalled_id = UINT64_MAX;
-                        stall_cycles = 0;
-                        id++;
-                        continue;
-                    }
-                    if (id != stalled_id)
-                    {
-                        stalled_id = id;
-                        stall_cycles = 1;
-                    }
-                    break;
-                }
-
-                stalled_id = UINT64_MAX;
-                stall_cycles = 0;
-                {
-                    // write human-readable event summary
-                    fprintf(outf,
-                            "%s.%s — wall:%" PRIu64 " ns  cpu:%" PRIu64 " ns "
-                            "tx:%" PRIu64 "  rx:%" PRIu64 "  io:%" PRIu64 "  alloc:%" PRIu64 "\n",
-                            ev.class_name, ev.method_name,
-                            ev.wdelta,
-                            ev.cdelta,
-                            ev.net_tx,
-                            ev.net_rx,
-                            ev.io,
-                            ev.alloc);
-
-                    publish_resource_demand_vector(&ev, cfg);
-
-                    // remove processed event so map window can advance
-                    bpf_map__delete_elem(map_ev, &id, sizeof(id), 0);
-                }
-                id++;
-            }
-            // Resume from the first id not yet consumed, not from `count`.
-            last_id = id;
-        }
+        drain_events(&st, false);
 
         // responsive sleep: break into smaller chunks to respond quickly to SIGINT
         const int total_ms = 5000;
@@ -246,6 +277,16 @@ static int run_tracing_loop(pid_t target_pid,
             slept += step_ms;
         }
     }
+
+    // Final drain. The interrupt arrives between polls, so everything recorded
+    // since the last cycle -- up to a full poll interval of transactions, plus
+    // any export backlog -- would otherwise be discarded on shutdown. Settle
+    // briefly first so events still in flight when the signal landed are
+    // written before the last read.
+    usleep(FINAL_DRAIN_SETTLE_MS * 1000);
+    uint64_t remaining = drain_events(&st, true);
+    if (remaining)
+        LOG_INFO("drained %" PRIu64 " remaining event(s) on shutdown", remaining);
 
     return 0;
 }

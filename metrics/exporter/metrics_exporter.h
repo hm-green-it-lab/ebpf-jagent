@@ -21,6 +21,28 @@ struct event;
 void publish_resource_demand_vector(const struct event *event, const struct otlp_config *cfg);
 
 /**
+ * Accumulates one event into its class+method metric entry and queues a
+ * datapoint for the next flush, without performing any network I/O.
+ *
+ * One datapoint is queued per event on purpose: differencing consecutive
+ * datapoints is what recovers per-transaction demand, so a batch must not be
+ * collapsed into a single value.
+ *
+ * @param event Pointer to the event. Must not be NULL.
+ */
+void record_resource_demand(const struct event *event);
+
+/**
+ * Sends every datapoint queued by record_resource_demand() as a single OTLP
+ * request, then clears the queue. Sending one request per event instead makes
+ * the drain loop wait on a full HTTP round trip per transaction, which cannot
+ * keep up with a busy service and causes events to be discarded at shutdown.
+ *
+ * @param cfg Pointer to a populated OTLP configuration. Must not be NULL.
+ */
+void flush_resource_demands(const struct otlp_config *cfg);
+
+/**
  * Sends a JSON payload containing the aggregate process CPU time (job-scoped) without
  * including per-method/resource breakdown. This function takes the raw CPU time in nanoseconds.
  *

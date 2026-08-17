@@ -43,6 +43,7 @@ static bool append_otlp_sum_metric(json_builder_t *jb, const char *name, const c
                                    const char *attributes_json, uint64_t start_time_ns, uint64_t current_time_ns);
 static void send_otlp_payload(const struct otlp_config *cfg, const char *json_payload);
 static size_t _curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata);
+static void free_pending_points(void);
 
 // global head of metrics list
 static metric_entry_t *g_metrics_head = NULL;
@@ -104,6 +105,8 @@ static metric_entry_t *find_or_create_metric(const char *class_name, const char 
 // free all metric entries
 void free_all_metric_entries(void)
 {
+    free_pending_points();
+
     metric_entry_t *current = g_metrics_head;
     while (current)
     {
@@ -375,7 +378,60 @@ static void send_otlp_payload(const struct otlp_config *cfg, const char *json_pa
 }
 
 // publish resource demand metrics for an event
-void publish_resource_demand_vector(const struct event *event, const struct otlp_config *cfg)
+static const char *DEMAND_METRIC_NAMES[4] = {
+    "ebpf.jagent.resource.demand.storage.bytes",
+    "ebpf.jagent.resource.demand.memory.bytes",
+    "ebpf.jagent.resource.demand.network.bytes",
+    "ebpf.jagent.resource.demand.cpu.ms"};
+static const char *DEMAND_METRIC_FORMATS[4] = {"%.0f", "%.0f", "%.0f", "%.3f"};
+
+// One transaction's snapshot of the cumulative counters, held until the batch
+// is flushed. Keeping a point per transaction is deliberate: differencing
+// consecutive datapoints is what recovers per-transaction demand, so collapsing
+// a batch into a single datapoint would destroy the granularity the agent
+// exists to provide.
+typedef struct pending_point
+{
+    char *class_name;
+    char *method_name;
+    uint64_t start_time_ns;
+    uint64_t time_ns;
+    double values[4]; // storage, memory, network, cpu -- same order as the names
+    struct pending_point *next;
+} pending_point_t;
+
+static pending_point_t *g_pending_head = NULL;
+static pending_point_t *g_pending_tail = NULL;
+static size_t g_pending_count = 0;
+
+// Append one datapoint to an already-open "dataPoints":[ array.
+static bool append_datapoint(json_builder_t *jb, const char *attributes_json,
+                             const char *value_str, uint64_t start_ns, uint64_t now_ns)
+{
+    return json_builder_appendf(
+        jb,
+        "{\"attributes\":%s,\"asDouble\":%s,"
+        "\"startTimeUnixNano\":\"%llu\",\"timeUnixNano\":\"%llu\"}",
+        attributes_json, value_str,
+        (unsigned long long)start_ns, (unsigned long long)now_ns);
+}
+
+static void free_pending_points(void)
+{
+    pending_point_t *current = g_pending_head;
+    while (current)
+    {
+        pending_point_t *next = current->next;
+        free(current->class_name);
+        free(current->method_name);
+        free(current);
+        current = next;
+    }
+    g_pending_head = g_pending_tail = NULL;
+    g_pending_count = 0;
+}
+
+void record_resource_demand(const struct event *event)
 {
     metric_entry_t *metric = find_or_create_metric(event->class_name, event->method_name);
     if (!metric)
@@ -387,64 +443,102 @@ void publish_resource_demand_vector(const struct event *event, const struct otlp
     metric->memory_bytes += event->alloc;
     metric->network_bytes += event->net_tx + event->net_rx;
 
-    uint64_t now_ns = get_current_time_ns();
-
-    json_builder_t jb, jb_attr;
-    if (!json_builder_init(&jb, 4096) || !json_builder_init(&jb_attr, 256))
+    pending_point_t *point = calloc(1, sizeof(*point));
+    if (!point)
     {
-        ERROR("Failed to initialize JSON builder.");
+        ERROR("Out of memory queueing a resource-demand datapoint.");
         return;
     }
 
-    if (!build_attributes_json(&jb_attr, event->class_name, event->method_name))
+    point->class_name = safe_strdup(event->class_name);
+    point->method_name = safe_strdup(event->method_name);
+    point->start_time_ns = metric->start_time_ns;
+    point->time_ns = get_current_time_ns();
+    point->values[0] = (double)metric->io_bytes;
+    point->values[1] = (double)metric->memory_bytes;
+    point->values[2] = (double)metric->network_bytes;
+    point->values[3] = (double)metric->cpu_ns / 1e6;
+
+    if (g_pending_tail)
+        g_pending_tail->next = point;
+    else
+        g_pending_head = point;
+    g_pending_tail = point;
+    g_pending_count++;
+}
+
+void flush_resource_demands(const struct otlp_config *cfg)
+{
+    if (!g_pending_head)
+        return;
+
+    json_builder_t jb, jb_res, jb_attr;
+    if (!json_builder_init(&jb, 65536) || !json_builder_init(&jb_res, 256) ||
+        !json_builder_init(&jb_attr, 256))
     {
-        ERROR("Failed to build attributes JSON.");
+        ERROR("Failed to initialize JSON builder.");
+        free_pending_points();
+        return;
+    }
+
+    // A batch spans several methods, so class/method belong on the datapoints
+    // rather than on the resource.
+    if (!build_attributes_json(&jb_res, NULL, NULL))
+    {
+        ERROR("Failed to build resource attributes JSON.");
         goto cleanup;
     }
 
-    // start payload with required scope field
     json_builder_appendf(&jb,
-                         "{"
-                         "\"resourceMetrics\":[{"
+                         "{\"resourceMetrics\":[{"
                          "\"resource\":{\"attributes\":%s},"
-                         "\"scopeMetrics\":[{"
-                         "\"scope\":{},"
-                         "\"metrics\":[",
-                         jb_attr.buffer);
-
-    const char *metric_names[] = {
-        "ebpf.jagent.resource.demand.storage.bytes",
-        "ebpf.jagent.resource.demand.memory.bytes",
-        "ebpf.jagent.resource.demand.network.bytes",
-        "ebpf.jagent.resource.demand.cpu.ms"};
-    double metric_values[] = {
-        (double)metric->io_bytes,
-        (double)metric->memory_bytes,
-        (double)metric->network_bytes,
-        (double)metric->cpu_ns / 1e6};
-    const char *metric_formats[] = {"%.0f", "%.0f", "%.0f", "%.3f"};
+                         "\"scopeMetrics\":[{\"scope\":{},\"metrics\":[",
+                         jb_res.buffer);
 
     for (int i = 0; i < 4; ++i)
     {
-        char value_buf[64];
-        snprintf(value_buf, sizeof(value_buf), metric_formats[i], metric_values[i]);
-
-        if (!append_otlp_sum_metric(&jb, metric_names[i], value_buf, jb_attr.buffer, metric->start_time_ns, now_ns))
-        {
-            ERROR("Failed to append metric %s", metric_names[i]);
-        }
-        if (i < 3)
+        if (i)
             json_builder_appendf(&jb, ",");
+        json_builder_appendf(&jb, "{\"name\":\"%s\",\"sum\":{\"dataPoints\":[",
+                             DEMAND_METRIC_NAMES[i]);
+
+        bool first = true;
+        for (pending_point_t *p = g_pending_head; p; p = p->next)
+        {
+            char value_buf[64];
+            snprintf(value_buf, sizeof(value_buf), DEMAND_METRIC_FORMATS[i], p->values[i]);
+
+            jb_attr.length = 0;
+            jb_attr.buffer[0] = '\0';
+            if (!build_attributes_json(&jb_attr, p->class_name, p->method_name))
+                continue;
+
+            if (!first)
+                json_builder_appendf(&jb, ",");
+            append_datapoint(&jb, jb_attr.buffer, value_buf, p->start_time_ns, p->time_ns);
+            first = false;
+        }
+
+        json_builder_appendf(&jb,
+                             "],\"aggregationTemporality\":"
+                             "\"AGGREGATION_TEMPORALITY_CUMULATIVE\",\"isMonotonic\":true}}");
     }
 
-    // close JSON
     json_builder_appendf(&jb, "]}]}]}");
-
     send_otlp_payload(cfg, jb.buffer);
 
 cleanup:
     json_builder_free(&jb);
+    json_builder_free(&jb_res);
     json_builder_free(&jb_attr);
+    free_pending_points();
+}
+
+void publish_resource_demand_vector(const struct event *event, const struct otlp_config *cfg)
+{
+    // Retained for callers that want the old one-request-per-event behaviour.
+    record_resource_demand(event);
+    flush_resource_demands(cfg);
 }
 
 // publish process CPU usage metric
