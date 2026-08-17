@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Semantic versions only, e.g. v0.0.1 — plus prereleases, e.g. v1.0.0-rc.1.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: read
+
+jobs:
+  # Reuses the CI workflow so a release is built through exactly the same
+  # toolchain and passes the same output verification as every commit.
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      artifact-name: ebpf-jagent-${{ github.ref_name }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    # Not containerised: this job needs the runner's preinstalled gh CLI.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ebpf-jagent-${{ github.ref_name }}
+          path: dist
+
+      - name: Package release tarball
+        id: package
+        run: |
+          set -eux
+          pkg="ebpf-jagent-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "staging/${pkg}"
+
+          cp dist/ebpf-jagent dist/ebpf_jagent.bpf.o "staging/${pkg}/"
+          cp README.md LICENSE "staging/${pkg}/"
+
+          # actions/upload-artifact does not preserve the executable bit.
+          chmod +x "staging/${pkg}/ebpf-jagent"
+
+          # Ship a redacted template, never the committed .env (it carries a
+          # real-looking OTLP_BEARER_TOKEN).
+          sed -e 's/^OTLP_BEARER_TOKEN=.*/OTLP_BEARER_TOKEN=/' \
+              .env > "staging/${pkg}/env.example"
+
+          cat > "staging/${pkg}/INSTALL.txt" <<EOF
+          ebpf-jagent ${GITHUB_REF_NAME} (linux/x86_64)
+
+          Built on Ubuntu 24.04 (glibc 2.39). The binary is dynamically linked;
+          the host needs:
+
+            libbpf1  libelf1  zlib1g  libcurl4
+
+            apt-get install libbpf1 libelf1 zlib1g libcurl4
+
+          The compiled BPF object is embedded in the binary. ebpf_jagent.bpf.o is
+          included only for inspection (e.g. bpftool prog dump / llvm-objdump).
+
+          Before running, copy env.example to .env in the working directory and
+          set JVM_LIB_PATH to your JVM's libjvm.so. Requires root (or CAP_BPF +
+          CAP_PERFMON), a kernel with BTF, and a JVM started with
+          -XX:+DTraceAllocProbes -XX:+DTraceMethodProbes.
+
+            sudo ./ebpf-jagent -p <java-pid> -f <filter>
+
+          See README.md for details.
+          EOF
+
+          tar -C staging -czf "${pkg}.tar.gz" "${pkg}"
+          sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
+          echo "pkg=${pkg}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKG: ${{ steps.package.outputs.pkg }}
+        run: |
+          set -eu
+          # A hyphen in the version (v1.0.0-rc.1) marks a semver prerelease.
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in
+            *-*) prerelease="--prerelease" ;;
+          esac
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            ${prerelease} \
+            "${PKG}.tar.gz" \
+            "${PKG}.tar.gz.sha256"

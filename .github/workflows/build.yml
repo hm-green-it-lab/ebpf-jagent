@@ -1,0 +1,105 @@
+name: Build
+
+on:
+  # Branches only: tag pushes are handled by release.yml, which calls this
+  # workflow. Without this filter a tag would build twice.
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: Name for the uploaded build artifact.
+        type: string
+        required: false
+        default: ''
+
+# A newer commit on the same branch supersedes an in-flight run.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Compile eBPF jAgent
+    runs-on: ubuntu-24.04
+    # Pinned to the same base image as containerized/Dockerfile so CI matches
+    # the documented build environment rather than the drifting runner image.
+    container: ubuntu:24.04
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git make \
+            gcc clang llvm binutils \
+            libbpf-dev libelf-dev zlib1g-dev libcurl4-openssl-dev \
+            libc6-dev linux-libc-dev \
+            linux-tools-generic
+
+      # Ubuntu ships no standalone `bpftool` package: /usr/bin/bpftool from
+      # linux-tools-common is a wrapper that resolves the real binary through
+      # `uname -r`, which inside a container reports the *host* kernel and so
+      # never matches. Put the real binary from linux-tools-generic on PATH
+      # ahead of that wrapper (/usr/local/bin precedes /usr/bin).
+      #
+      # The Makefile skips skeleton generation with a warning when bpftool is
+      # missing, which would let a broken build report success. Fail hard here.
+      - name: Provide bpftool
+        run: |
+          real_bpftool="$(find /usr/lib -type f -name bpftool -perm -u+x | sort | tail -n 1)"
+          if [ -z "$real_bpftool" ]; then
+            echo "::error::no bpftool binary found under /usr/lib; the Makefile would silently skip skeleton generation"
+            exit 1
+          fi
+          ln -sf "$real_bpftool" /usr/local/bin/bpftool
+          echo "using $real_bpftool"
+          bpftool version
+
+      # Mirrors the symlink in containerized/Dockerfile: clang -target bpf does
+      # not search the multiarch include path, so asm/ must be reachable.
+      - name: Link asm headers
+        run: test -e /usr/include/asm || ln -s /usr/include/asm-generic /usr/include/asm
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Record toolchain versions
+        run: |
+          clang --version | head -n 1
+          gcc --version | head -n 1
+          bpftool version | head -n 1
+          echo "libbpf: $(pkg-config --modversion libbpf 2>/dev/null || echo unknown)"
+
+      - name: Build
+        run: make clean all
+
+      - name: Verify build outputs
+        run: |
+          set -eux
+          test -s ebpf_jagent.bpf.o
+          test -s ebpf_jagent.skel.h
+          test -x ebpf-jagent
+          # Assert the BPF object really targets BPF and is not a host object.
+          readelf -h ebpf_jagent.bpf.o | grep -q 'Linux BPF'
+          # Assert the skeleton has real content (a bpftool failure truncates it to 0 bytes).
+          grep -q 'ebpf_jagent_bpf__open' ebpf_jagent.skel.h
+          # Assert every BPF program in the source made it into the object.
+          for prog in method_entry method_return kprobe_sock_sendmsg \
+                      kretprobe_sock_recvmsg trace_sys_enter_write object_alloc; do
+            grep -qF "&obj->progs.$prog;" ebpf_jagent.skel.h
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          # `inputs` is empty on push/PR, so this falls back to the commit SHA.
+          name: ${{ inputs.artifact-name || format('ebpf-jagent-{0}', github.sha) }}
+          path: |
+            ebpf-jagent
+            ebpf_jagent.bpf.o
+            ebpf_jagent.skel.h
+          if-no-files-found: error
+          retention-days: 14
