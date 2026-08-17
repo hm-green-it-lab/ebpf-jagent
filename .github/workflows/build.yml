@@ -1,0 +1,83 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A newer commit on the same branch supersedes an in-flight run.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Compile eBPF jAgent
+    runs-on: ubuntu-24.04
+    # Pinned to the same base image as containerized/Dockerfile so CI matches
+    # the documented build environment rather than the drifting runner image.
+    container: ubuntu:24.04
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git make \
+            gcc clang llvm bpftool binutils \
+            libbpf-dev libelf-dev zlib1g-dev libcurl4-openssl-dev \
+            libc6-dev linux-libc-dev
+
+      # Mirrors the symlink in containerized/Dockerfile: clang -target bpf does
+      # not search the multiarch include path, so asm/ must be reachable.
+      - name: Link asm headers
+        run: test -e /usr/include/asm || ln -s /usr/include/asm-generic /usr/include/asm
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Record toolchain versions
+        run: |
+          clang --version | head -n 1
+          gcc --version | head -n 1
+          bpftool version | head -n 1
+          echo "libbpf: $(pkg-config --modversion libbpf 2>/dev/null || echo unknown)"
+
+      # The Makefile skips skeleton generation with a warning when bpftool is
+      # missing, which would let a broken build report success. Fail here first.
+      - name: Verify bpftool is present
+        run: |
+          command -v bpftool >/dev/null || {
+            echo "::error::bpftool not installed; the Makefile would silently skip skeleton generation"
+            exit 1
+          }
+
+      - name: Build
+        run: make clean all
+
+      - name: Verify build outputs
+        run: |
+          set -eux
+          test -s ebpf_jagent.bpf.o
+          test -s ebpf_jagent.skel.h
+          test -x ebpf-jagent
+          # Assert the BPF object really targets BPF and is not a host object.
+          readelf -h ebpf_jagent.bpf.o | grep -q 'Linux BPF'
+          # Assert the skeleton has real content (a bpftool failure truncates it to 0 bytes).
+          grep -q 'ebpf_jagent_bpf__open' ebpf_jagent.skel.h
+          # Assert every BPF program in the source made it into the object.
+          for prog in method_entry method_return kprobe_sock_sendmsg \
+                      kretprobe_sock_recvmsg trace_sys_enter_write object_alloc; do
+            grep -qF "&obj->progs.$prog;" ebpf_jagent.skel.h
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ebpf-jagent-${{ github.sha }}
+          path: |
+            ebpf-jagent
+            ebpf_jagent.bpf.o
+            ebpf_jagent.skel.h
+          if-no-files-found: error
+          retention-days: 14
