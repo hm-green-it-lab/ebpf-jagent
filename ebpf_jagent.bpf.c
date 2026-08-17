@@ -93,14 +93,29 @@ static __always_inline __u32 fnv1a_hash(const char *buf, __u32 len)
     return h;
 }
 
+// Publish one completed method invocation to user space.
+//
+// The slot is reserved *before* the event is written. Reading the counter,
+// writing at that key and then incrementing -- the previous order -- is not
+// atomic as a whole: two threads returning from an instrumented method
+// concurrently would read the same id, both write that key (one silently
+// overwriting the other) and then both increment, consuming two ids for one
+// stored event. That loses the overwritten event and leaves a hole at the
+// skipped key. The loss scales with concurrency; at 50 transactions/s roughly
+// a quarter of all events disappeared this way.
+//
+// __sync_fetch_and_add returns the value from before the addition, so every
+// caller gets a distinct id. It compiles to a BPF atomic fetch-add, which
+// needs a kernel >= 5.12.
 static __always_inline void push_event(const struct event *ev)
 {
     __u32 zero = 0;
-    __u64 *id = bpf_map_lookup_elem(&event_cnt, &zero);
-    if (!id)
+    __u64 *counter = bpf_map_lookup_elem(&event_cnt, &zero);
+    if (!counter)
         return;
-    bpf_map_update_elem(&events_map, id, ev, BPF_ANY);
-    __sync_fetch_and_add(id, 1);
+
+    __u64 id = __sync_fetch_and_add(counter, 1);
+    bpf_map_update_elem(&events_map, &id, ev, BPF_ANY);
 }
 
 SEC("usdt/method_entry")

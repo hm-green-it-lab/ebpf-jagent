@@ -22,6 +22,11 @@
 #define MAX_FILTER_LEN 64
 #define DEFAULT_OUTPUT_FILE "method_trace.txt"
 
+// Drain cycles to wait for a reserved-but-unwritten event before giving up on
+// it. One cycle is normally enough; the bound only exists so a genuinely lost
+// event cannot stall the drain indefinitely.
+#define MAX_STALL_CYCLES 3
+
 // Selectable resource dimensions.
 //
 // CPU and the transaction boundary both come from the method__entry/
@@ -148,6 +153,11 @@ static int run_tracing_loop(pid_t target_pid,
     uint32_t event_cnt_key = 0;
     uint64_t last_id = 0;
 
+    // Tracks an id whose slot is reserved but not yet readable, so the drain
+    // can wait for it without blocking forever if it never appears.
+    uint64_t stalled_id = UINT64_MAX;
+    unsigned stall_cycles = 0;
+
     if (!no_print)
     {
         printf("\n\n === End of eBPF Logs === \n");
@@ -170,11 +180,38 @@ static int run_tracing_loop(pid_t target_pid,
         if (bpf_map__lookup_elem(map_cnt, &event_cnt_key, sizeof(event_cnt_key),
                                  &count, sizeof(count), 0) == 0)
         {
-            for (uint64_t id = last_id; id < count; id++)
+            // A slot is reserved (counter incremented) marginally before the
+            // event is written, so the newest id may not be readable yet.
+            // Stop at the first gap and retry on the next cycle instead of
+            // advancing past it: the previous code set last_id = count
+            // unconditionally, which discarded any not-yet-written event
+            // permanently. A gap that never fills is skipped after
+            // MAX_STALL_CYCLES so one lost event cannot stall the drain.
+            uint64_t id = last_id;
+            while (id < count)
             {
                 struct event ev;
                 if (bpf_map__lookup_elem(map_ev, &id, sizeof(id),
-                                         &ev, sizeof(ev), 0) == 0)
+                                         &ev, sizeof(ev), 0) != 0)
+                {
+                    if (id == stalled_id && ++stall_cycles >= MAX_STALL_CYCLES)
+                    {
+                        LOG_ERROR("event %" PRIu64 " never materialised; skipping", id);
+                        stalled_id = UINT64_MAX;
+                        stall_cycles = 0;
+                        id++;
+                        continue;
+                    }
+                    if (id != stalled_id)
+                    {
+                        stalled_id = id;
+                        stall_cycles = 1;
+                    }
+                    break;
+                }
+
+                stalled_id = UINT64_MAX;
+                stall_cycles = 0;
                 {
                     // write human-readable event summary
                     fprintf(outf,
@@ -193,8 +230,10 @@ static int run_tracing_loop(pid_t target_pid,
                     // remove processed event so map window can advance
                     bpf_map__delete_elem(map_ev, &id, sizeof(id), 0);
                 }
+                id++;
             }
-            last_id = count;
+            // Resume from the first id not yet consumed, not from `count`.
+            last_id = id;
         }
 
         // responsive sleep: break into smaller chunks to respond quickly to SIGINT
