@@ -24,9 +24,29 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates git make \
-            gcc clang llvm bpftool binutils \
+            gcc clang llvm binutils \
             libbpf-dev libelf-dev zlib1g-dev libcurl4-openssl-dev \
-            libc6-dev linux-libc-dev
+            libc6-dev linux-libc-dev \
+            linux-tools-generic
+
+      # Ubuntu ships no standalone `bpftool` package: /usr/bin/bpftool from
+      # linux-tools-common is a wrapper that resolves the real binary through
+      # `uname -r`, which inside a container reports the *host* kernel and so
+      # never matches. Put the real binary from linux-tools-generic on PATH
+      # ahead of that wrapper (/usr/local/bin precedes /usr/bin).
+      #
+      # The Makefile skips skeleton generation with a warning when bpftool is
+      # missing, which would let a broken build report success. Fail hard here.
+      - name: Provide bpftool
+        run: |
+          real_bpftool="$(find /usr/lib -type f -name bpftool -perm -u+x | sort | tail -n 1)"
+          if [ -z "$real_bpftool" ]; then
+            echo "::error::no bpftool binary found under /usr/lib; the Makefile would silently skip skeleton generation"
+            exit 1
+          fi
+          ln -sf "$real_bpftool" /usr/local/bin/bpftool
+          echo "using $real_bpftool"
+          bpftool version
 
       # Mirrors the symlink in containerized/Dockerfile: clang -target bpf does
       # not search the multiarch include path, so asm/ must be reachable.
@@ -42,15 +62,6 @@ jobs:
           gcc --version | head -n 1
           bpftool version | head -n 1
           echo "libbpf: $(pkg-config --modversion libbpf 2>/dev/null || echo unknown)"
-
-      # The Makefile skips skeleton generation with a warning when bpftool is
-      # missing, which would let a broken build report success. Fail here first.
-      - name: Verify bpftool is present
-        run: |
-          command -v bpftool >/dev/null || {
-            echo "::error::bpftool not installed; the Makefile would silently skip skeleton generation"
-            exit 1
-          }
 
       - name: Build
         run: make clean all
