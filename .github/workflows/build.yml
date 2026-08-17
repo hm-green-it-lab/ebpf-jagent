@@ -1,9 +1,19 @@
 name: Build
 
 on:
+  # Branches only: tag pushes are handled by release.yml, which calls this
+  # workflow. Without this filter a tag would build twice.
   push:
+    branches: ['**']
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: Name for the uploaded build artifact.
+        type: string
+        required: false
+        default: ''
 
 # A newer commit on the same branch supersedes an in-flight run.
 concurrency:
@@ -85,7 +95,8 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ebpf-jagent-${{ github.sha }}
+          # `inputs` is empty on push/PR, so this falls back to the commit SHA.
+          name: ${{ inputs.artifact-name || format('ebpf-jagent-{0}', github.sha) }}
           path: |
             ebpf-jagent
             ebpf_jagent.bpf.o
