@@ -255,9 +255,29 @@ int method_return(struct pt_regs *ctx)
     if (ev.wdelta < min_duration_ns)
         return 0;
 
+    // Stop the CPU clock here, not after the name resolution below.
+    //
+    // This handler runs on the measured thread, so everything it does lands in
+    // that thread's sum_exec_runtime and inside the interval being reported.
+    // Reading cpu_end after the four argument reads, the two copies out of user
+    // memory and the substring match billed all of that to the transaction that
+    // triggered it. The reads still happen only for calls that survive the
+    // duration gate, so moving the sample above them costs nothing.
+    //
+    // This removes only the emitted call's own tail. The much larger term --
+    // handler time for the nested calls between this frame's entry and return
+    // -- cannot be excluded from inside the probe, because most of it is trap
+    // and uprobe dispatch that no BPF program is running during. Quantifying
+    // that needs the firing count and the no-op control.
+    cpu_end = task_cpu_ns(task, now);
+    ev.cdelta = cpu_end > f->cstart ? cpu_end - f->cstart : 0;
+    // An unsigned subtraction that underflowed here would export ~1.8e19 ns.
+    if (ev.cdelta > ev.wdelta)
+        ev.cdelta = ev.wdelta;
+
     // Everything below runs only for events that can still be emitted, so the
-    // four USDT argument reads, the two user-memory string reads and the
-    // CPU-time reads are all skipped for calls dropped on duration.
+    // four USDT argument reads and the two user-memory string reads are all
+    // skipped for calls dropped on duration.
     if (bpf_usdt_arg(ctx, 1, &cls_ptr) ||
         bpf_usdt_arg(ctx, 2, &cls_len) ||
         bpf_usdt_arg(ctx, 3, &mth_ptr) ||
@@ -279,12 +299,6 @@ int method_return(struct pt_regs *ctx)
 
     if (!name_matches(ev.class_name, c1) && !name_matches(ev.method_name, c2))
         return 0;
-
-    cpu_end = task_cpu_ns(task, now);
-    ev.cdelta = cpu_end > f->cstart ? cpu_end - f->cstart : 0;
-    // An unsigned subtraction that underflowed here would export ~1.8e19 ns.
-    if (ev.cdelta > ev.wdelta)
-        ev.cdelta = ev.wdelta;
 
     bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
 
