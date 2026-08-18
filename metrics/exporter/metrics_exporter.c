@@ -464,6 +464,20 @@ static const char *DEMAND_METRIC_NAMES[4] = {
     "ebpf.jagent.resource.demand.cpu.ms"};
 static const char *DEMAND_METRIC_FORMATS[4] = {"%.0f", "%.0f", "%.0f", "%.3f"};
 
+// Parallel to DEMAND_METRIC_NAMES. Index 3 (cpu) stays true: it comes from the
+// method probes that delimit a transaction, so there is no configuration in
+// which it is unmeasured. Defaults to everything, matching an agent started
+// without --probes; see configure_published_dimensions().
+static bool g_publish_dimension[4] = {true, true, true, true};
+
+void configure_published_dimensions(bool memory, bool network, bool storage)
+{
+    g_publish_dimension[0] = storage;
+    g_publish_dimension[1] = memory;
+    g_publish_dimension[2] = network;
+    g_publish_dimension[3] = true;
+}
+
 // One transaction's snapshot of the cumulative counters, held until the batch
 // is flushed. Keeping a point per transaction is deliberate: differencing
 // consecutive datapoints is what recovers per-transaction demand, so collapsing
@@ -570,10 +584,21 @@ void flush_resource_demands(const struct otlp_config *cfg)
                          "\"scopeMetrics\":[{\"scope\":{},\"metrics\":[",
                          jb_res.buffer);
 
+    bool first_metric = true;
     for (int i = 0; i < 4; ++i)
     {
-        if (i)
+        // Skip dimensions whose probe was never attached: their values are
+        // structurally zero, and a zero series reads as a measurement.
+        if (!g_publish_dimension[i])
+            continue;
+
+        // Tracked separately from the loop index, which no longer implies
+        // position now that entries can be skipped -- keying the separator on
+        // `i` would emit a leading comma whenever dimension 0 is disabled.
+        if (!first_metric)
             json_builder_appendf(&jb, ",");
+        first_metric = false;
+
         json_builder_appendf(&jb, "{\"name\":\"%s\",\"sum\":{\"dataPoints\":[",
                              DEMAND_METRIC_NAMES[i]);
 

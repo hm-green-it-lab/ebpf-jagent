@@ -493,6 +493,11 @@ int main(int argc, char **argv)
         }
     }
 
+    // Export exactly what was attached above. Publishing a dimension whose
+    // probe is not attached emits a flat-zero series that a consumer cannot
+    // distinguish from a genuine measurement of zero.
+    configure_published_dimensions(probes.memory, probes.network, probes.storage);
+
     if (!no_print)
     {
         LOG_INFO("collecting: cpu%s%s%s",

@@ -10,6 +10,31 @@
 struct event;
 
 /**
+ * Restricts which resource dimensions are exported, to match the probes that
+ * were actually attached.
+ *
+ * Without this the exporter emits all four series unconditionally, so a run
+ * started with --probes cpu,memory publishes network and storage series that
+ * are flat zero for their whole length. A consumer cannot tell that apart from
+ * a genuine measurement of zero traffic, which is the more dangerous reading:
+ * it looks like evidence that the transaction performed no I/O rather than an
+ * absence of evidence. Publishing only what was measured makes the payload
+ * self-describing.
+ *
+ * CPU is always exported: it comes from the method__entry/method__return probes
+ * that delimit a transaction, so it cannot be switched off while anything is
+ * being measured at all.
+ *
+ * Call once at start-up, before the first flush. Defaults to publishing
+ * everything, which is what an agent started without --probes does.
+ *
+ * @param memory  Export ebpf.jagent.resource.demand.memory.bytes  (usdt object__alloc)
+ * @param network Export ebpf.jagent.resource.demand.network.bytes (kretprobe sock_send/recvmsg)
+ * @param storage Export ebpf.jagent.resource.demand.storage.bytes (tracepoint sys_exit_write)
+ */
+void configure_published_dimensions(bool memory, bool network, bool storage);
+
+/**
  * This updates (or creates) the metric entry for the given class+method in \p event,
  * accumulates CPU, I/O, memory, and network deltas, and sends a JSON payload
  * containing those per-method/resource metrics to the OTLP endpoint specified in the .env file.
