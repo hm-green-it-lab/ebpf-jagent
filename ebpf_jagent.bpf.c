@@ -8,11 +8,25 @@
 #define MAX_FILTER_LEN 64
 
 // Frames deeper than this are still counted, so entry and return stay balanced,
-// but they are not measured. Java stacks routinely nest far deeper than the
-// frames anyone attributes resources to, and those deep frames dominate the
-// probe firing count. Resources consumed below the cap roll up into the deepest
-// tracked frame rather than being discarded -- see live_frame().
-#define MAX_TRACE_DEPTH 32
+// but they are not measured. Resources consumed below the cap roll up into the
+// deepest tracked frame rather than being discarded -- see live_frame().
+//
+// This is a safety bound against runaway recursion, not a cost control. It was
+// 32, which sits *above* the method being measured: a Spring request reaches
+// application code only after some fifty frames of Tomcat, servlet filters and
+// DispatcherServlet, so both probes returned early for it and the agent emitted
+// nothing at all -- while appearing faster than the no-op control, because not
+// measuring is cheaper than measuring.
+//
+// Raising it does not recover the saving, and no value can. The frames that
+// dominate the firing count are the JDK calls *inside* the measured method, so
+// any cap high enough to give the target a frame is also high enough to give
+// one to everything it calls. Skipping cheap calls is min_duration_ns's job;
+// that gate is depth-independent and keeps the rollup exact.
+//
+// 128 covers a Tomcat/Spring stack with headroom, at 48 B * 128 = 6 KB of task
+// storage per thread. Must stay a power of two for DEPTH_MASK.
+#define MAX_TRACE_DEPTH 128
 
 // Power-of-two masks let the verifier prove every index stays in range.
 #define NAME_MASK (MAX_NAME_LEN - 1)
